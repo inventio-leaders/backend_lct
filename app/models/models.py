@@ -14,27 +14,27 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from app.database import get_db, Base
+
 import enum
 
 class MeasurementType(enum.Enum):
-    ПОДАЧА = "Подача"
-    ОБРАТКА = "Обратка"
-    ПОТРЕБЛЕНИЕ = "Потребление"
-    T1 = "T1"
-    T2 = "T2"
+    Подача = "Подача"
+    Обратка = "Обратка"
+    Потребление = "Потребление"
+    Т1 = "T1"
+    Т2 = "T2"
 
 
 class SeverityLevel(enum.Enum):
-    НИЗКИЙ = "Низкий"
-    СРЕДНИЙ = "Средний"
-    ВЫСОКИЙ = "Высокий"
+    Низкий = "Низкий"
+    Средний = "Средний"
+    Высокий = "Высокий"
 
 
 class EventLabel(enum.Enum):
-    УТЕЧКА = "Реальная утечка"
-    ЛОЖНОЕ = "Ложное срабатывание"
-    НОРМА = "Норма"
-
+    Утечка = "Утечка"
+    Ложное = "Ложное"
+    Норма = "Норма"
 
 class User(SQLAlchemyBaseUserTable[int], Base):
     __tablename__ = "users"
@@ -64,7 +64,7 @@ class Sensors(Base):
 class RawData(Base):
     __tablename__ = "raw_data"
     record_id = Column(Integer, primary_key=True)
-    datetime = Column(DateTime, nullable=False)
+    datetime = Column(DateTime(timezone=True), nullable=False)
     sensor_id = Column(Integer, ForeignKey("sensors.sensor_id"), nullable=False)
     value = Column(DECIMAL(10, 3), nullable=False)
 
@@ -73,6 +73,7 @@ class RawData(Base):
             MeasurementType,
             name="measurement_type_enum",
             metadata=Base.metadata,
+            validate_strings = True
         ),
         nullable=False,
     )
