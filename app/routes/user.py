@@ -3,12 +3,17 @@ from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
+from .anomalies_routes import anomalies_router
 from .dependecies import fastapi_users
 from app.auth.auth import auth_backend
 from app.helpers.helpers import to_start, to_shutdown, create_admin
 from app.schemas.user_schemas import UserCreate, UserRead, UserOut
 
 from app.logging_config import app_logger
+from .event_log_routes import event_log_router
+from .forecasts_routes import forecasts_router
+from .models_routes import models_router
+from .processed_data_routes import processed_router
 from .raw_data_routes import raw_router
 from .sensors_routes import sensor_router
 
@@ -86,3 +91,8 @@ app.include_router(
 
 app.include_router(sensor_router)
 app.include_router(raw_router)
+app.include_router(processed_router)
+app.include_router(models_router)
+app.include_router(forecasts_router)
+app.include_router(anomalies_router)
+app.include_router(event_log_router)
