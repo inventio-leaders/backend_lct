@@ -51,10 +51,14 @@ class User(SQLAlchemyBaseUserTable[int], Base):
 class Sensors(Base):
     __tablename__ = "sensors"
     sensor_id = Column(Integer, primary_key=True)
-    name = Column(String(50), nullable=False)  # "ГВС", "ХВС"
+    name = Column(String(50), nullable=False)     # "ГВС", "ХВС"
     location = Column(String(100), nullable=False)
 
-    raw_data = relationship("RawData", back_populates="sensor")
+    raw_data = relationship(
+        "RawData",
+        back_populates="sensor",
+        lazy="selectin"
+    )
 
 
 class RawData(Base):
@@ -73,7 +77,11 @@ class RawData(Base):
         nullable=False,
     )
 
-    sensor = relationship("Sensors", back_populates="raw_data")
+    sensor = relationship(
+        "Sensors",
+        back_populates="raw_data",
+        lazy="selectin"
+    )
 
 
 class ProcessedData(Base):
@@ -90,7 +98,11 @@ class ProcessedData(Base):
     temp_gvs_return = Column(DECIMAL(5, 2), nullable=False)
     temp_delta = Column(DECIMAL(5, 2), nullable=False)
 
-    forecasts = relationship("Forecasts", back_populates="processed_data")
+    forecasts = relationship(
+        "Forecasts",
+        back_populates="processed_data",
+        lazy="selectin"
+    )
 
 
 class Models(Base):
@@ -99,11 +111,15 @@ class Models(Base):
     training_date = Column(DateTime, nullable=False)
     last_retrained = Column(DateTime, nullable=False)
     metrics = Column(String, nullable=False)  # JSON: {"rmse": 0.05, "f1": 0.92}
-    name = Column(String(50), nullable=False)  # "NARX-LSTM", "LSTM-AE"
+    name = Column(String(50), nullable=False) # "NARX-LSTM", "LSTM-AE"
     version = Column(String(20), nullable=False)
     file_path = Column(String(255), nullable=False)
 
-    forecasts = relationship("Forecasts", back_populates="model")
+    forecasts = relationship(
+        "Forecasts",
+        back_populates="model",
+        lazy="selectin"
+    )
 
 
 class Forecasts(Base):
@@ -117,10 +133,22 @@ class Forecasts(Base):
     processed_data_id = Column(Integer, ForeignKey("processed_data.record_id"), nullable=False)
     model_id = Column(Integer, ForeignKey("models.model_id"), nullable=False)
 
-    processed_data = relationship("ProcessedData", back_populates="forecasts")
-    model = relationship("Models", back_populates="forecasts")
-
-    anomaly = relationship("Anomalies", uselist=False, back_populates="forecast")
+    processed_data = relationship(
+        "ProcessedData",
+        back_populates="forecasts",
+        lazy="selectin"
+    )
+    model = relationship(
+        "Models",
+        back_populates="forecasts",
+        lazy="selectin"
+    )
+    anomaly = relationship(
+        "Anomalies",
+        uselist=False,
+        back_populates="forecast",
+        lazy="selectin"
+    )
 
 
 class Anomalies(Base):
@@ -144,8 +172,16 @@ class Anomalies(Base):
 
     forecast_id = Column(Integer, ForeignKey("forecasts.forecast_id"), nullable=False)
 
-    forecast = relationship("Forecasts", back_populates="anomaly")
-    events = relationship("EventLog", back_populates="anomaly")
+    forecast = relationship(
+        "Forecasts",
+        back_populates="anomaly",
+        lazy="selectin"
+    )
+    events = relationship(
+        "EventLog",
+        back_populates="anomaly",
+        lazy="selectin"
+    )
 
 
 class EventLog(Base):
@@ -167,7 +203,12 @@ class EventLog(Base):
 
     operator_id = Column(String(50), nullable=False)
 
-    anomaly = relationship("Anomalies", back_populates="events")
+    anomaly = relationship(
+        "Anomalies",
+        back_populates="events",
+        lazy="selectin"
+    )
+
 
 async def get_user_db(session: AsyncSession = Depends(get_db)):
     yield SQLAlchemyUserDatabase(session, User)
