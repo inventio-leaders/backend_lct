@@ -1,0 +1,11 @@
+[lint]
+select = ["F", "E", "W", "I", "UP", "YTT", "BLE", "B", "A", "C4", "T10", "TID", "SIM", "PTH", "ERA", "PD", "PGH", "PL", "TRY", "FLY", "NPY", "PERF", "Q", "RUF", "SLF", "SLOT", "ARG", "PTH", "PIE", "COM", "C4", "T20"]
+ignore = ["E501", "C901"]
+
+[lint.isort]
+known-first-party = ["app"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
