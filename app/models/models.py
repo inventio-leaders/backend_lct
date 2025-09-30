@@ -171,7 +171,7 @@ class Anomalies(Base):
         nullable=False,
     )
 
-    forecast_id = Column(Integer, ForeignKey("forecasts.forecast_id"), nullable=False)
+    forecast_id = Column(Integer, ForeignKey("forecasts.forecast_id"), nullable=True)
 
     forecast = relationship(
         "Forecasts",
@@ -181,32 +181,6 @@ class Anomalies(Base):
     events = relationship(
         "EventLog",
         back_populates="anomaly",
-        lazy="selectin"
-    )
-
-
-class EventLog(Base):
-    __tablename__ = "event_log"
-    event_id = Column(Integer, primary_key=True)
-    datetime = Column(DateTime, nullable=False)
-    confirmed_at = Column(DateTime, nullable=True)
-
-    anomaly_id = Column(Integer, ForeignKey("anomalies.anomaly_id"), nullable=False)
-
-    label = Column(
-        SAEnum(
-            EventLabel,
-            name="event_label_enum",
-            metadata=Base.metadata,
-        ),
-        nullable=False,
-    )
-
-    operator_id = Column(String(50), nullable=False)
-
-    anomaly = relationship(
-        "Anomalies",
-        back_populates="events",
         lazy="selectin"
     )
 

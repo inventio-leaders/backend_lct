@@ -4,6 +4,8 @@ from datetime import datetime as Dt
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DataError
 
@@ -20,6 +22,12 @@ from app.helpers.processed_data_helpers import (
     create_processed_record,
     update_processed_record,
     delete_processed_record, import_processed_data_from_excels,
+)
+
+from app.helpers.anomalies_helpers import (
+    compute_anomalies_from_processed,
+    persist_anomalies,
+    build_anomalies_xlsx_bytes,
 )
 
 processed_router = APIRouter(
@@ -75,6 +83,42 @@ async def api_count_processed_data(
         offset=0,
     )
     return total
+
+@processed_router.get("/export-xlsx")
+async def api_export_processed_to_xlsx(
+    dt_from: Optional[Dt] = Query(None),
+    dt_to: Optional[Dt] = Query(None),
+    threshold_pct: float = Query(10.0, ge=0, le=100, description="Порог отклонения в процентах"),
+    save_to_db: bool = Query(True, description="Сохранять найденные аномалии в БД"),
+    filename: str = Query("processed_anomalies.xlsx"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Экспортирует XLSX с «Все данные» и «Аномалии», рассчитанными по processed_data.
+    При save_to_db=True — записывает новые аномалии в таблицу anomalies (без дублей по datetime).
+    """
+    try:
+        df_all, df_anoms = await compute_anomalies_from_processed(
+            db, dt_from=dt_from, dt_to=dt_to, threshold_pct=threshold_pct
+        )
+
+        inserted = skipped = 0
+        if save_to_db and not df_anoms.empty:
+            inserted, skipped = await persist_anomalies(db, df_anoms)
+
+        xlsx_bytes = await build_anomalies_xlsx_bytes(df_all, df_anoms)
+
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+        return StreamingResponse(
+            BytesIO(xlsx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers,
+        )
+    except (ValueError, IntegrityError, DataError) as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @processed_router.get("/{record_id}", response_model=ProcessedDataOut)

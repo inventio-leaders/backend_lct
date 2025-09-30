@@ -15,7 +15,7 @@ class AnomalyBase(BaseModel):
     operator_notes: Optional[str] = Field(None, description="Комментарий оператора")
     mse_error: Dec8_6_Pos = Field(..., description="Ошибка MSE для события")
     severity_level: SeverityLevel = Field(..., description="Уровень серьёзности")
-    forecast_id: int = Field(..., ge=1, description="FK → forecasts.forecast_id")
+    forecast_id: Optional[int] = Field(..., ge=1, description="FK → forecasts.forecast_id")
 
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
