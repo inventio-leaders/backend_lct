@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime as Dt
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DataError
 
@@ -19,7 +19,7 @@ from app.helpers.processed_data_helpers import (
     get_processed_record,
     create_processed_record,
     update_processed_record,
-    delete_processed_record,
+    delete_processed_record, import_processed_data_from_excels,
 )
 
 processed_router = APIRouter(
@@ -126,3 +126,19 @@ async def api_delete_processed_record(
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Record not found")
     return None
+
+@processed_router.post("/import-excel", status_code=status.HTTP_201_CREATED)
+async def api_import_processed_data_from_excels(
+    files: List[UploadFile] = File(..., description="Один или несколько .xlsx файлов"),
+    dedupe: bool = Query(True, description="Пропускать уже существующие по datetime записи"),
+    db: AsyncSession = Depends(get_db),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="Не переданы файлы")
+
+    try:
+        result = await import_processed_data_from_excels(db, files, dedupe=dedupe)
+        return result
+    except (ValueError, IntegrityError, DataError) as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
