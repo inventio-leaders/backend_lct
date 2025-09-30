@@ -21,3 +21,4 @@ pandas
 tensorflow
 keras
 scikit-learn
+starlette

@@ -8,6 +8,7 @@ from traceback import format_exc
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.services.task_manager import TASKS
 from app.services.ml_io import load_pickle, load_keras, MODEL_DIR
@@ -19,6 +20,8 @@ from app.helpers.ml_db import (
 )
 from app.models.models import ProcessedData, Models
 
+
+# ---------- helpers ----------
 
 async def _fetch_processed_window(db: AsyncSession, last_hours: int) -> List[ProcessedData]:
     q = select(ProcessedData).order_by(ProcessedData.datetime.desc()).limit(last_hours)
@@ -52,10 +55,7 @@ async def _ensure_model_meta(
     version: str = "disk-import",
     metrics: Optional[dict] = None,
 ) -> Models:
-    """
-    Если записи модели нет — создаём минимальную,
-    указывая путь к уже существующему файлу весов.
-    """
+    """Если записи модели нет — создаём минимальную, с путём к файлу весов."""
     m = await get_latest_model_by_name(db, name)
     if m:
         return m
@@ -63,7 +63,7 @@ async def _ensure_model_meta(
     m = Models(
         training_date=datetime.utcnow(),
         last_retrained=datetime.utcnow(),
-        metrics=json.dumps(metrics or {}),  # например {"rmse": ..., "mae": ...}
+        metrics=json.dumps(metrics or {}),
         name=name,
         version=version,
         file_path=str((MODEL_DIR / file_name).as_posix()),
@@ -73,12 +73,10 @@ async def _ensure_model_meta(
     return m
 
 
+# ---------- jobs ----------
+
 async def forecast_job(tid: str, db_factory, horizon_hours: int):
-    """
-    Итеративный прогноз на horizon_hours вперёд.
-    Использует последние W часов из ProcessedData.
-    Если отсутствует запись Models для NARX-LSTM — регистрирует автоматически.
-    """
+    """Итеративный прогноз на horizon_hours вперёд (использует последние W часов)."""
     info = TASKS.get(tid)
     info.set(status="RUNNING", progress="prepare")
 
@@ -87,7 +85,7 @@ async def forecast_job(tid: str, db_factory, horizon_hours: int):
         W = int(fi["window_size"])
         feats = fi["narx_features"]
 
-        model = load_keras("narx_lstm_model.h5")     # внутри load_keras: compile=False
+        model = load_keras("narx_lstm_model.h5")     # compile=False внутри load_keras
         scaler = load_pickle("scaler_narx.pkl")
 
         async with db_factory() as db:
@@ -96,7 +94,7 @@ async def forecast_job(tid: str, db_factory, horizon_hours: int):
                 name="NARX-LSTM",
                 file_name="narx_lstm_model.h5",
                 version="disk-import",
-                metrics={},  # если нужно — можешь проставить фактические метрики
+                metrics={},
             )
 
             last_rows = await _fetch_processed_window(db, W)
@@ -104,24 +102,21 @@ async def forecast_job(tid: str, db_factory, horizon_hours: int):
                 info.set(status="FAILURE", error=f"Need {W} rows, got {len(last_rows)}")
                 return
 
-            # историческое окно -> масштабирование
             X_hist = np.array([[ _row_to_features(r)[f] for f in feats ] for r in last_rows], dtype=float)
             Xs = scaler.transform(X_hist)
 
             preds: List[float] = []
             curr = Xs.copy()
 
-            # итеративный прогноз
-            for h in range(horizon_hours):
+            for _ in range(horizon_hours):
                 x = curr[-W:, :][None, :, :]  # (1, W, F)
-                y_s = model.predict(x, verbose=0)  # (1,1) scaled
+                y_s = await run_in_threadpool(model.predict, x, verbose=0) # scaled (1,1)
 
-                # inverse только целевой
                 pad = np.concatenate([y_s, np.zeros((1, len(feats) - 1))], axis=1)
                 y = float(scaler.inverse_transform(pad)[0, 0])
+                y = max(0.0, y)
                 preds.append(round(y, 3))
 
-                # формируем "следующую" строку фич
                 next_features = _row_to_features(last_rows[-1])
                 next_hour_before = next_features["Hour"]
 
@@ -154,12 +149,14 @@ async def forecast_job(tid: str, db_factory, horizon_hours: int):
 
 async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt_to: Optional[datetime]):
     """
-    Скан аномалий LSTM-AE по всему диапазону (скользящее окно W).
-    Если записи модели в БД нет — используем дефолтный threshold и продолжаем.
+    Скан аномалий LSTM-AE по диапазону [dt_from, dt_to).
+    Если в диапазоне меньше W записей, используем исторический префикс (до W-1 строк) из БД,
+    чтобы сформировать окна нужной длины и посчитать аномалии для часов внутри диапазона.
     """
 
     def _to_naive_utc(dt):
-        if dt is None: return None
+        if dt is None:
+            return None
         return dt if dt.tzinfo is None else dt.astimezone(timezone.utc).replace(tzinfo=None)
 
     dt_from = _to_naive_utc(dt_from)
@@ -173,10 +170,10 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
         W = int(fi["window_size"])
         feats_ae = fi["ae_features"]
 
-        model = load_keras("ae_model.h5")            # compile=False внутри load_keras
+        model = load_keras("ae_model.h5")     # compile=False внутри load_keras
         scaler = load_pickle("scaler_ae.pkl")
 
-        # 1) Пытаемся взять threshold из метаданных модели (если есть)
+        # 1) Порог из метаданных, если есть
         thr = None
         async with db_factory() as db:
             meta = await get_latest_model_by_name(db, "LSTM-AE")
@@ -186,47 +183,114 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
                     thr = float(metrics.get("ae_threshold")) if metrics else None
                 except Exception:
                     thr = None
-
-        # 2) Фоллбек, если метаданных нет/повреждены
         if thr is None:
-            thr = 0.02  # аккуратный дефолт
+            thr = 0.02
 
-        # 3) Берём данные и сканим
         async with db_factory() as db:
-            q = select(ProcessedData)
+            # 2) Тянем строки в диапазоне (цель для маркировки аномалий)
+            q_target = select(ProcessedData)
             if dt_from:
-                q = q.where(ProcessedData.datetime >= dt_from)
+                q_target = q_target.where(ProcessedData.datetime >= dt_from)
             if dt_to:
-                q = q.where(ProcessedData.datetime < dt_to)
-            q = q.order_by(ProcessedData.datetime.asc())
-            res = await db.execute(q)
-            rows = res.scalars().all()
+                q_target = q_target.where(ProcessedData.datetime < dt_to)
+            q_target = q_target.order_by(ProcessedData.datetime.asc())
+            res = await db.execute(q_target)
+            target_rows: List[ProcessedData] = res.scalars().all()
 
-            if len(rows) < W:
-                info.set(status="FAILURE", error=f"Need at least {W} rows")
-                return
+            # Если в диапазоне ничего нет — попробуем просканить всё
+            if not target_rows:
+                q_all = select(ProcessedData).order_by(ProcessedData.datetime.asc())
+                res_all = await db.execute(q_all)
+                all_rows: List[ProcessedData] = res_all.scalars().all()
+                if len(all_rows) < W:
+                    # даже глобально не хватает строк
+                    info.set(status="FAILURE", error=f"Need at least {W} rows globally, found {len(all_rows)}")
+                    return
+                # сканим всё; аномалии будут помечены для всех окон
+                combined_rows = all_rows
+                prefix_len = 0
+                mark_from_dt = None
+                mark_to_dt = None
+            else:
+                # 3) Есть строки в диапазоне; если их < W — подтянем префикс из истории
+                if len(target_rows) < W:
+                    first_dt = target_rows[0].datetime
+                    q_prefix = (
+                        select(ProcessedData)
+                        .where(ProcessedData.datetime < first_dt)
+                        .order_by(ProcessedData.datetime.desc())
+                        .limit(W - 1)
+                    )
+                    res_pref = await db.execute(q_prefix)
+                    prefix_rows_desc = res_pref.scalars().all()
+                    prefix_rows = list(reversed(prefix_rows_desc))
+                else:
+                    prefix_rows = []
 
+                combined_rows = prefix_rows + target_rows
+                prefix_len = len(prefix_rows)
+
+                # границы маркировки (аномалию создаём только если конец окна внутри целевого диапазона)
+                mark_from_dt = target_rows[0].datetime
+                mark_to_dt = target_rows[-1].datetime if not dt_to else dt_to
+
+                # если даже с префиксом суммарно < W — попробуем зацепить глобальную историю
+                if len(combined_rows) < W:
+                    q_more = (
+                        select(ProcessedData)
+                        .where(ProcessedData.datetime < (target_rows[0].datetime if target_rows else dt_to))
+                        .order_by(ProcessedData.datetime.desc())
+                        .limit(W - len(combined_rows))
+                    )
+                    res_more = await db.execute(q_more)
+                    more_desc = res_more.scalars().all()
+                    more_prefix = list(reversed(more_desc))
+                    combined_rows = more_prefix + combined_rows
+                    prefix_len += len(more_prefix)
+
+                # если по-прежнему < W даже во всей БД — честный фейл
+                if len(combined_rows) < W:
+                    # посчитаем глобальный объём
+                    from sqlalchemy import func
+                    res_cnt = await db.execute(select(func.count(ProcessedData.record_id)))
+                    total_cnt = int(res_cnt.scalar_one() or 0)
+                    info.set(status="FAILURE", error=f"Need at least {W} rows globally, found {total_cnt}")
+                    return
+
+            # 4) Преобразуем в матрицу признаков и масштабируем один раз
+            X_all = np.array(
+                [[_row_to_features_ae(r)[f] for f in feats_ae] for r in combined_rows],
+                dtype=float,
+            )
+            Xs_all = scaler.transform(X_all)
+
+            # 5) Скользящее окно длины W; предсказываем в тредпуле
             created = 0
-            buf: List[List[float]] = []
-
-            for i, r in enumerate(rows):
-                buf.append([_row_to_features_ae(r)[f] for f in feats_ae])
-                if len(buf) < W:
+            for i in range(len(combined_rows)):
+                # конец окна должен быть не раньше, чем W-1
+                if i + 1 < W:
                     continue
 
-                X = np.array(buf[-W:], dtype=float)
-                Xs = scaler.transform(X)
-                x = Xs[None, :, :]
-                x_rec = model.predict(x, verbose=0)
-                mse = float(np.mean(np.square(x - x_rec)))
+                end_row = combined_rows[i]
+
+                # если задано окно маркировки — создаём аномалии только для окон, чей "конец" внутри диапазона
+                if mark_from_dt and end_row.datetime < mark_from_dt:
+                    continue
+                if mark_to_dt and end_row.datetime >= mark_to_dt:
+                    continue
+
+                window_Xs = Xs_all[i - W + 1 : i + 1]   # (W, F)
+                x = window_Xs[None, :, :]               # (1, W, F)
+                x_rec = await run_in_threadpool(model.predict, x, verbose=0)  # (1, W, F)
+                mse = float(np.mean(np.square(window_Xs - x_rec[0])))
 
                 if mse > thr:
                     severity = _severity_from_mse(mse, thr)
                     await create_anomaly(
                         db,
-                        pd_row=rows[i],       # текущий конец окна
+                        pd_row=end_row,         # конец окна — текущий час
                         mse_error=mse,
-                        threshold=thr,        # используется для вычисления severity
+                        threshold=thr,
                         severity=severity,
                         forecast=None,
                         is_confirmed=False,

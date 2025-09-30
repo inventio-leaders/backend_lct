@@ -1,4 +1,3 @@
-# services/training_jobs.py
 from __future__ import annotations
 
 import json
@@ -16,9 +15,10 @@ from sklearn.preprocessing import MinMaxScaler
 from keras.layers import LSTM, Dense, Dropout, RepeatVector, TimeDistributed
 from keras.models import Sequential
 from keras.optimizers import Adam
+from starlette.concurrency import run_in_threadpool
 
 from app.services.task_manager import TASKS
-from app.services.ml_io import save_pickle, save_keras, new_version
+from app.services.ml_io import save_pickle, save_keras, new_version, MODEL_DIR
 from app.models.models import Models, ProcessedData
 
 
@@ -59,7 +59,7 @@ async def processed_stats(db: AsyncSession):
 
 async def fetch_processed_df(db: AsyncSession, dt_from: Optional[datetime], dt_to: Optional[datetime]) -> pd.DataFrame:
     """
-    Тянем processed_data; если фильтр дал 0 строк — делаем фоллбек на весь диапазон.
+    Тянем processed_data; если фильтр дал 0 строк — фоллбек на весь диапазон.
     Даты приводим к naive UTC перед запросом.
     """
     dt_from, dt_to = _fix_range(dt_from, dt_to)
@@ -186,19 +186,25 @@ async def train_job(
                         LSTM(64, activation='relu'),
                         Dropout(0.2),
                         Dense(32, activation='relu'),
-                        Dense(1)
+                        Dense(1, activation='relu')
                     ])
                     # важно: без строковых метрик; метрики посчитаем руками
                     model_narx.compile(optimizer=Adam(1e-3), loss='mse')
-                    model_narx.fit(Xtr, ytr, validation_data=(Xval, yval), epochs=50, batch_size=32, verbose=0)
 
+                    # уводим тяжёлую работу в поток
+                    await run_in_threadpool(
+                        model_narx.fit,
+                        Xtr, ytr,
+                        validation_data=(Xval, yval), epochs=50, batch_size=32, verbose=0
+                    )
                     # обратное масштабирование для оценки
                     def _inv(vec):
                         pad = np.concatenate([vec.reshape(-1, 1), np.zeros((len(vec), len(feature_columns) - 1))], axis=1)
                         return scaler_narx.inverse_transform(pad)[:, 0]
 
                     yte_inv = _inv(yte)
-                    yhat_inv = _inv(model_narx.predict(Xte, verbose=0).reshape(-1))
+                    yhat_scaled = await run_in_threadpool(model_narx.predict, Xte, verbose=0)
+                    yhat_inv = _inv(yhat_scaled.reshape(-1))
                     mae = float(mean_absolute_error(yte_inv, yhat_inv))
                     rmse = float(np.sqrt(mean_squared_error(yte_inv, yhat_inv)))
 
@@ -206,11 +212,10 @@ async def train_job(
                     save_keras(model_narx, "narx_lstm_model.h5")
                     save_pickle(scaler_narx, "scaler_narx.pkl")
 
-                    version = new_version("NARX")
+                    version = new_version("NARX", max_len=20)
                     results["narx"] = {"version": version, "rmse": rmse, "mae": mae}
                     any_trained = True
 
-                    # запись в Models
                     async with db_factory() as db:
                         m = Models(
                             training_date=datetime.utcnow(),
@@ -218,7 +223,7 @@ async def train_job(
                             metrics=json.dumps({"rmse": rmse, "mae": mae}),
                             name="NARX-LSTM",
                             version=version,
-                            file_path="services/model/narx_lstm_model.h5",
+                            file_path=str((MODEL_DIR / "narx_lstm_model.h5").as_posix()),
                         )
                         db.add(m)
                         await db.commit()
@@ -244,26 +249,32 @@ async def train_job(
                         TimeDistributed(Dense(len(ae_feature_columns)))
                     ])
                     model_ae.compile(optimizer=Adam(1e-3), loss='mae')
+
                     s1 = int(0.8 * len(Xa)); s2 = int(0.9 * len(Xa))
                     s1 = max(1, min(s1, len(Xa)-1))
-                    s2 = max(s1, min(s2, len(Xa)))  # для валидации можно оставить пусто, Keras выдержит
+                    s2 = max(s1, min(s2, len(Xa)))  # может не быть валидации
 
                     Xtr = Xa[:s1]
                     Xval = Xa[s1:s2] if s2 > s1 else None
-                    val_data = (Xval, Xval) if Xval is not None and len(Xval) else None
+                    val_kwargs = {"validation_data": (Xval, Xval)} if (Xval is not None and len(Xval)) else {}
 
-                    model_ae.fit(Xtr, Xtr, validation_data=val_data, epochs=50, batch_size=32, verbose=0)
+                    # обучение в тредпуле
+                    await run_in_threadpool(
+                        model_ae.fit,
+                        Xtr, Xtr,
+                        epochs=50, batch_size=32, verbose=0, **val_kwargs
+                    )
 
-                    # threshold по валидации (если нет валидации — по трейну, аккуратно)
-                    Xref = Xval if val_data else Xtr
-                    Xref_rec = model_ae.predict(Xref, verbose=0)
+                    # threshold по валидации (если нет — по трейну)
+                    Xref = Xval if (Xval is not None and len(Xval)) else Xtr
+                    Xref_rec = await run_in_threadpool(model_ae.predict, Xref, verbose=0)
                     mse_val = np.mean(np.square(Xref - Xref_rec), axis=(1, 2))
                     thr = float(np.percentile(mse_val, ae_threshold_percentile))
 
                     save_keras(model_ae, "ae_model.h5")
                     save_pickle(scaler_ae, "scaler_ae.pkl")
 
-                    version = new_version("AE")
+                    version = new_version("AE", max_len=20)
                     results["ae"] = {"version": version, "ae_threshold": thr}
                     any_trained = True
 
@@ -274,7 +285,7 @@ async def train_job(
                             metrics=json.dumps({"ae_threshold": thr}),
                             name="LSTM-AE",
                             version=version,
-                            file_path="services/model/ae_model.h5",
+                            file_path=str((MODEL_DIR / "ae_model.h5").as_posix()),
                         )
                         db.add(m)
                         await db.commit()
@@ -282,7 +293,6 @@ async def train_job(
         if any_trained:
             info.set(status="SUCCESS", result=results, progress="done")
         else:
-            # ничего не обучили — вернём понятное сообщение
             info.set(status="FAILURE", error=f"Nothing trained: {results}", progress="done")
 
     except Exception as e:
