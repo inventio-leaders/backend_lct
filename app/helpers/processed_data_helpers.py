@@ -106,9 +106,6 @@ async def delete_processed_record(db: AsyncSession, record_id: int) -> bool:
     await db.commit()
     return (res.rowcount or 0) > 0
 
-# ===================== НОВОЕ: импорт из Excel ===================== #
-
-# Ожидаемые заголовки (русские) из примеров
 GVS_REQUIRED = {
     "Дата",
     "Время суток, ч",
@@ -215,8 +212,6 @@ async def import_processed_data_from_excels(
     - Если в каком-то наборе не хватает значений, числовые поля дополнительно заполняются нулями.
     - Dedupe=True: не вставлять записи с datetime, которые уже есть в БД.
     """
-
-    # Читаем все книги
     gvs_frames: List[pd.DataFrame] = []
     hvs_frames: List[pd.DataFrame] = []
 
@@ -224,25 +219,22 @@ async def import_processed_data_from_excels(
         if not f.filename.lower().endswith(".xlsx"):
             raise ValueError(f"Поддерживаются только .xlsx (получен {f.filename})")
 
-        content = await f.read()  # чтение файла в память
+        content = await f.read()
         try:
             xls = pd.ExcelFile(content, engine="openpyxl")
         except Exception as e:
             raise ValueError(f"Не удалось открыть {f.filename}: {e}")
 
-        # Евристика: выбираем первый лист. При желании — можно расширить.
         for sheet in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet)
 
             cols = set(df.columns)
 
-            # Определяем тип по наборам колонок
             if GVS_REQUIRED.issubset(cols):
                 gvs_frames.append(_normalize_gvs(df))
             elif HVS_REQUIRED_MIN.issubset(cols):
                 hvs_frames.append(_normalize_hvs(df))
             else:
-                # Пропускаем листы с неподходящими колонками, чтобы не ломать импорт из файлов с «лишними» листами.
                 continue
 
     if not gvs_frames and not hvs_frames:
@@ -255,7 +247,6 @@ async def import_processed_data_from_excels(
         columns=["datetime", "hour", "hvs_consumption_m3"]
     )
 
-    # Объединяем по datetime+hour (outer join, чтобы покрыть неполные наборы)
     merged = pd.merge(
         gvs,
         hvs,
@@ -267,21 +258,17 @@ async def import_processed_data_from_excels(
     if merged.empty:
         return {"inserted": 0, "skipped_existing": 0, "total_rows": 0}
 
-    # Обогащаем вычисляемыми полями
     merged["day_of_week"] = merged["datetime"].dt.weekday
     merged["is_weekend"] = merged["day_of_week"].isin([5, 6])
 
-    # Температуры и потребления могут быть NaN, заменим нулями
     for col in ["gvs_consumption_m3", "hvs_consumption_m3", "t1_supply", "t2_return"]:
         if col not in merged.columns:
             merged[col] = 0
         merged[col] = merged[col].fillna(0)
 
-    # Дельты
     merged["temp_delta"] = merged["t1_supply"] - merged["t2_return"]
     merged["delta_gvs_hvs"] = merged["gvs_consumption_m3"] - merged["hvs_consumption_m3"]
 
-    # Приводим к схеме БД (имена колонок как в модели)
     merged = merged.rename(
         columns={
             "gvs_consumption_m3": "consumption_gvs",
@@ -291,8 +278,6 @@ async def import_processed_data_from_excels(
         }
     )
 
-    # Преобразование типов и квантование под DECIMAL(…)
-    # consumption_* -> 8,3 ; temp_* -> 5,2
     records: List[Dict[str, Any]] = []
     for row in merged.itertuples(index=False):
         dt_val: datetime = getattr(row, "datetime")
@@ -314,11 +299,8 @@ async def import_processed_data_from_excels(
 
     total_rows = len(records)
 
-    # Дедупликация по datetime (и по совместительству по hour, т.к. он однозначно задан)
     skipped_existing = 0
     if dedupe:
-        # Достаём уже существующие datetime из БД для данного набора
-        # Чтобы не перегружать IN (...), пойдём чанками
         CHUNK = 1000
         existing_set = set()
         for i in range(0, total_rows, CHUNK):
