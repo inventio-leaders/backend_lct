@@ -184,6 +184,15 @@ class Anomalies(Base):
         lazy="selectin"
     )
 
+class EventLog(Base):
+    __tablename__ = "event_log"
+    event_id = Column(Integer, primary_key=True)
+    anomaly_id = Column(Integer, ForeignKey("anomalies.anomaly_id"), nullable=False)
+    label = Column(SAEnum(EventLabel, name="event_label_enum", metadata=Base.metadata), nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False)
+
+    anomaly = relationship("Anomalies", back_populates="events", lazy="selectin")
 
 async def get_user_db(session: AsyncSession = Depends(get_db)):
     yield SQLAlchemyUserDatabase(session, User)

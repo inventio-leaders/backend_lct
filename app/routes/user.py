@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
 from .anomalies_routes import anomalies_router
+from .batch_router import batch_router
 from .dependecies import fastapi_users
 from app.auth.auth import auth_backend
 from app.helpers.helpers import to_start, to_shutdown, create_admin
@@ -155,3 +156,4 @@ app.include_router(processed_router)
 app.include_router(models_router)
 app.include_router(forecasts_router)
 app.include_router(anomalies_router)
+app.include_router(batch_router)
