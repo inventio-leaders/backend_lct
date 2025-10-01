@@ -21,7 +21,6 @@ from app.helpers.ml_db import (
 from app.models.models import ProcessedData, Models
 
 
-# ---------- helpers ----------
 
 async def _fetch_processed_window(db: AsyncSession, last_hours: int) -> List[ProcessedData]:
     q = select(ProcessedData).order_by(ProcessedData.datetime.desc()).limit(last_hours)
@@ -73,7 +72,6 @@ async def _ensure_model_meta(
     return m
 
 
-# ---------- jobs ----------
 
 async def forecast_job(tid: str, db_factory, horizon_hours: int):
     """Итеративный прогноз на horizon_hours вперёд (использует последние W часов)."""
@@ -85,7 +83,7 @@ async def forecast_job(tid: str, db_factory, horizon_hours: int):
         W = int(fi["window_size"])
         feats = fi["narx_features"]
 
-        model = load_keras("narx_lstm_model.h5")     # compile=False внутри load_keras
+        model = load_keras("narx_lstm_model.h5")
         scaler = load_pickle("scaler_narx.pkl")
 
         async with db_factory() as db:
@@ -170,10 +168,9 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
         W = int(fi["window_size"])
         feats_ae = fi["ae_features"]
 
-        model = load_keras("ae_model.h5")     # compile=False внутри load_keras
+        model = load_keras("ae_model.h5")
         scaler = load_pickle("scaler_ae.pkl")
 
-        # 1) Порог из метаданных, если есть
         thr = None
         async with db_factory() as db:
             meta = await get_latest_model_by_name(db, "LSTM-AE")
@@ -187,7 +184,6 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
             thr = 0.02
 
         async with db_factory() as db:
-            # 2) Тянем строки в диапазоне (цель для маркировки аномалий)
             q_target = select(ProcessedData)
             if dt_from:
                 q_target = q_target.where(ProcessedData.datetime >= dt_from)
@@ -197,22 +193,18 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
             res = await db.execute(q_target)
             target_rows: List[ProcessedData] = res.scalars().all()
 
-            # Если в диапазоне ничего нет — попробуем просканить всё
             if not target_rows:
                 q_all = select(ProcessedData).order_by(ProcessedData.datetime.asc())
                 res_all = await db.execute(q_all)
                 all_rows: List[ProcessedData] = res_all.scalars().all()
                 if len(all_rows) < W:
-                    # даже глобально не хватает строк
                     info.set(status="FAILURE", error=f"Need at least {W} rows globally, found {len(all_rows)}")
                     return
-                # сканим всё; аномалии будут помечены для всех окон
                 combined_rows = all_rows
                 prefix_len = 0
                 mark_from_dt = None
                 mark_to_dt = None
             else:
-                # 3) Есть строки в диапазоне; если их < W — подтянем префикс из истории
                 if len(target_rows) < W:
                     first_dt = target_rows[0].datetime
                     q_prefix = (
@@ -230,11 +222,9 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
                 combined_rows = prefix_rows + target_rows
                 prefix_len = len(prefix_rows)
 
-                # границы маркировки (аномалию создаём только если конец окна внутри целевого диапазона)
                 mark_from_dt = target_rows[0].datetime
                 mark_to_dt = target_rows[-1].datetime if not dt_to else dt_to
 
-                # если даже с префиксом суммарно < W — попробуем зацепить глобальную историю
                 if len(combined_rows) < W:
                     q_more = (
                         select(ProcessedData)
@@ -248,47 +238,41 @@ async def anomaly_scan_job(tid: str, db_factory, dt_from: Optional[datetime], dt
                     combined_rows = more_prefix + combined_rows
                     prefix_len += len(more_prefix)
 
-                # если по-прежнему < W даже во всей БД — честный фейл
                 if len(combined_rows) < W:
-                    # посчитаем глобальный объём
                     from sqlalchemy import func
                     res_cnt = await db.execute(select(func.count(ProcessedData.record_id)))
                     total_cnt = int(res_cnt.scalar_one() or 0)
                     info.set(status="FAILURE", error=f"Need at least {W} rows globally, found {total_cnt}")
                     return
 
-            # 4) Преобразуем в матрицу признаков и масштабируем один раз
             X_all = np.array(
                 [[_row_to_features_ae(r)[f] for f in feats_ae] for r in combined_rows],
                 dtype=float,
             )
             Xs_all = scaler.transform(X_all)
 
-            # 5) Скользящее окно длины W; предсказываем в тредпуле
             created = 0
             for i in range(len(combined_rows)):
-                # конец окна должен быть не раньше, чем W-1
                 if i + 1 < W:
                     continue
 
                 end_row = combined_rows[i]
 
-                # если задано окно маркировки — создаём аномалии только для окон, чей "конец" внутри диапазона
                 if mark_from_dt and end_row.datetime < mark_from_dt:
                     continue
                 if mark_to_dt and end_row.datetime >= mark_to_dt:
                     continue
 
-                window_Xs = Xs_all[i - W + 1 : i + 1]   # (W, F)
-                x = window_Xs[None, :, :]               # (1, W, F)
-                x_rec = await run_in_threadpool(model.predict, x, verbose=0)  # (1, W, F)
+                window_Xs = Xs_all[i - W + 1 : i + 1]
+                x = window_Xs[None, :, :]
+                x_rec = await run_in_threadpool(model.predict, x, verbose=0)
                 mse = float(np.mean(np.square(window_Xs - x_rec[0])))
 
                 if mse > thr:
                     severity = _severity_from_mse(mse, thr)
                     await create_anomaly(
                         db,
-                        pd_row=end_row,         # конец окна — текущий час
+                        pd_row=end_row,
                         mse_error=mse,
                         threshold=thr,
                         severity=severity,

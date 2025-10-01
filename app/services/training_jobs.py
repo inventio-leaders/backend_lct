@@ -22,8 +22,6 @@ from app.services.ml_io import save_pickle, save_keras, new_version, MODEL_DIR
 from app.models.models import Models, ProcessedData
 
 
-# ---------------------- time helpers ----------------------
-
 def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
     """Привести datetime к naive UTC, чтобы сравнивать с колонкой DateTime (без TZ)."""
     if dt is None:
@@ -41,8 +39,6 @@ def _fix_range(dt_from: Optional[datetime], dt_to: Optional[datetime]) -> tuple[
         return None, None
     return f, t
 
-
-# ---------------------- DB helpers ----------------------
 
 async def processed_stats(db: AsyncSession):
     """Вернёт (count, min_datetime, max_datetime) по processed_data."""
@@ -74,7 +70,6 @@ async def fetch_processed_df(db: AsyncSession, dt_from: Optional[datetime], dt_t
     res = await db.execute(q)
     rows = res.scalars().all()
 
-    # фоллбек без фильтра, если выборка пустая
     if not rows and (dt_from is not None or dt_to is not None):
         res_f = await db.execute(base_q)
         rows = res_f.scalars().all()
@@ -98,7 +93,6 @@ async def fetch_processed_df(db: AsyncSession, dt_from: Optional[datetime], dt_t
     return df
 
 
-# ---------------------- ML helpers ----------------------
 
 def _create_sequences(data: np.ndarray, target: np.ndarray, window: int):
     X, y = [], []
@@ -108,11 +102,10 @@ def _create_sequences(data: np.ndarray, target: np.ndarray, window: int):
     return np.array(X), np.array(y)
 
 
-# ---------------------- main job ----------------------
 
 async def train_job(
     tid: str,
-    db_factory,  # callable -> AsyncSession
+    db_factory,
     *,
     train_narx: bool,
     train_ae: bool,
@@ -125,12 +118,10 @@ async def train_job(
     info.set(status="RUNNING", progress="fetch data")
 
     try:
-        # 1) Загружаем данные
         async with db_factory() as db:
             df = await fetch_processed_df(db, dt_from, dt_to)
 
         if df.empty:
-            # добавим полезную статистику, чтобы было видно, что в БД вообще есть
             async with db_factory() as db:
                 cnt, dt_min, dt_max = await processed_stats(db)
             msg = "No processed_data in range"
@@ -149,7 +140,6 @@ async def train_job(
         ]
         target_column = 'Consumption_GVS'
 
-        # сохраняем мета-файл с фичами — он нужен и для инференса AE
         save_pickle({
             "narx_features": feature_columns,
             "ae_features": ae_feature_columns,
@@ -160,7 +150,6 @@ async def train_job(
         results: Dict[str, dict] = {}
         any_trained = False
 
-        # 2) Обучение NARX-LSTM
         if train_narx:
             if len(df) <= window:
                 results["narx"] = {"skipped": True, "reason": f"not enough rows: len={len(df)} <= window={window}"}
@@ -173,7 +162,6 @@ async def train_job(
                     results["narx"] = {"skipped": True, "reason": f"no sequences for window={window}"}
                 else:
                     s1 = int(0.8 * len(Xn)); s2 = int(0.9 * len(Xn))
-                    # защита от слишком маленьких датасетов
                     s1 = max(1, min(s1, len(Xn)-2))
                     s2 = max(s1+1, min(s2, len(Xn)-1))
 
@@ -188,16 +176,13 @@ async def train_job(
                         Dense(32, activation='relu'),
                         Dense(1, activation='relu')
                     ])
-                    # важно: без строковых метрик; метрики посчитаем руками
                     model_narx.compile(optimizer=Adam(1e-3), loss='mse')
 
-                    # уводим тяжёлую работу в поток
                     await run_in_threadpool(
                         model_narx.fit,
                         Xtr, ytr,
                         validation_data=(Xval, yval), epochs=50, batch_size=32, verbose=0
                     )
-                    # обратное масштабирование для оценки
                     def _inv(vec):
                         pad = np.concatenate([vec.reshape(-1, 1), np.zeros((len(vec), len(feature_columns) - 1))], axis=1)
                         return scaler_narx.inverse_transform(pad)[:, 0]
@@ -208,7 +193,6 @@ async def train_job(
                     mae = float(mean_absolute_error(yte_inv, yhat_inv))
                     rmse = float(np.sqrt(mean_squared_error(yte_inv, yhat_inv)))
 
-                    # сохраняем артефакты
                     save_keras(model_narx, "narx_lstm_model.h5")
                     save_pickle(scaler_narx, "scaler_narx.pkl")
 
@@ -228,7 +212,6 @@ async def train_job(
                         db.add(m)
                         await db.commit()
 
-        # 3) Обучение LSTM-AE
         if train_ae:
             if len(df) <= window:
                 results["ae"] = {"skipped": True, "reason": f"not enough rows: len={len(df)} <= window={window}"}
@@ -252,20 +235,18 @@ async def train_job(
 
                     s1 = int(0.8 * len(Xa)); s2 = int(0.9 * len(Xa))
                     s1 = max(1, min(s1, len(Xa)-1))
-                    s2 = max(s1, min(s2, len(Xa)))  # может не быть валидации
+                    s2 = max(s1, min(s2, len(Xa)))
 
                     Xtr = Xa[:s1]
                     Xval = Xa[s1:s2] if s2 > s1 else None
                     val_kwargs = {"validation_data": (Xval, Xval)} if (Xval is not None and len(Xval)) else {}
 
-                    # обучение в тредпуле
                     await run_in_threadpool(
                         model_ae.fit,
                         Xtr, Xtr,
                         epochs=50, batch_size=32, verbose=0, **val_kwargs
                     )
 
-                    # threshold по валидации (если нет — по трейну)
                     Xref = Xval if (Xval is not None and len(Xval)) else Xtr
                     Xref_rec = await run_in_threadpool(model_ae.predict, Xref, verbose=0)
                     mse_val = np.mean(np.square(Xref - Xref_rec), axis=(1, 2))
