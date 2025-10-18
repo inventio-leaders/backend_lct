@@ -25,7 +25,7 @@ def _recipients_from(user: User) -> list[str]:
 async def api_train(payload: TrainIn, user: User = Depends(current_user)):
     tid = TASKS.create(
         "train",
-        owner_user_id=str(user.id),
+        owner_user_id=user.id,
         recipients=_recipients_from(user),
         meta={"requested_by": getattr(user, "email", None)},
     )
@@ -48,7 +48,7 @@ async def api_train(payload: TrainIn, user: User = Depends(current_user)):
 async def api_forecast_run(payload: ForecastRunIn, user: User = Depends(current_user)):
     tid = TASKS.create(
         "forecast_run",
-        owner_user_id=str(user.id),
+        owner_user_id=user.id,
         recipients=_recipients_from(user),
         meta={"requested_by": getattr(user, "email", None)},
     )
@@ -60,7 +60,7 @@ async def api_forecast_run(payload: ForecastRunIn, user: User = Depends(current_
 async def api_anomaly_scan(payload: AnomalyScanIn, user: User = Depends(current_user)):
     tid = TASKS.create(
         "anomaly_scan",
-        owner_user_id=str(user.id),
+        owner_user_id=user.id,
         recipients=_recipients_from(user),
         meta={"requested_by": getattr(user, "email", None)},
     )

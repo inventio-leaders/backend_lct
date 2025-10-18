@@ -11,6 +11,8 @@ class UserRead(BaseUser[int]):
     is_superuser: bool = False
     is_verified: bool = False
 
+    notifications_enabled: bool
+
     class Config:
         orm_mode = True
 
@@ -31,3 +33,6 @@ class UserCreate(BaseUserCreate):
     is_active: Optional[bool] = True
     is_superuser: Optional[bool] = False
     is_verified: Optional[bool] = False
+
+class UserUpdate(BaseUser[int]):
+    notifications_enabled: bool

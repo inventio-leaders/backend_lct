@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import os, json, smtplib, ssl, threading, queue
 from typing import Iterable, Set, List
 from email.message import EmailMessage
+from uuid import UUID
+
+from sqlalchemy import select, cast, String
+
+from app.database import async_session
+from app.models.models import User
+from app.services.task_manager import TaskManager, TaskInfo
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -32,20 +40,73 @@ class EmailNotifier:
 
     def attach_to_task_manager(self, manager: "TaskManager"):
         self.start()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.get_event_loop()
+
         def listener(tid: str, info: "TaskInfo", changed: set[str]):
             if self.only_on_fields and not (self.only_on_fields & changed):
                 return
-            to = info.recipients or self.default_to
-            if not to:
-                return
-            subject = f"{self.subject_prefix} {info.kind} · {tid[:8]} · {info.status}"
-            body = self._render_body(tid, info, changed)
-            msg = self._build_msg(subject, body)
-            try:
-                self._q.put_nowait((to, msg))
-            except queue.Full:
-                pass
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(
+                    asyncio.create_task, self._handle_event_async(tid, info, changed)
+                )
+            else:
+                to = info.recipients or self.default_to
+                if not to:
+                    return
+                subject = f"{self.subject_prefix} {info.kind} · {tid[:8]} · {info.status}"
+                body = self._render_body(tid, info, changed)
+                msg = self._build_msg(subject, body)
+                try:
+                    self._q.put_nowait((to, msg))
+                except queue.Full:
+                    pass
+
         manager.subscribe(listener)
+
+    async def _handle_event_async(self, tid: str, info: "TaskInfo", changed: set[str]):
+        uid = getattr(info, "owner_user_id", None)
+        if uid is not None:
+            criterion = None
+            try:
+                if isinstance(uid, str) and uid.isdigit():
+                    uid = int(uid)
+            except Exception:
+                pass
+            try:
+                if isinstance(uid, int):
+                    criterion = (User.id == uid)
+                else:
+                    if isinstance(uid, str):
+                        try:
+                            uid_uuid = UUID(uid)
+                            criterion = (User.id == uid_uuid)
+                        except ValueError:
+                            criterion = (cast(User.id, String) == uid)
+                    else:
+                        criterion = (cast(User.id, String) == cast(uid, String))
+            except Exception:
+                return
+
+            async with async_session() as db:
+                res = await db.execute(select(User).where(criterion))
+                user = res.scalar_one_or_none()
+                if user and not getattr(user, "notifications_enabled", True):
+                    return  # у пользователя уведомления выключены — выходим
+
+        to = info.recipients or self.default_to
+        if not to:
+            return
+
+        subject = f"{self.subject_prefix} {info.kind} · {tid[:8]} · {info.status}"
+        body = self._render_body(tid, info, changed)
+        msg = self._build_msg(subject, body)
+        try:
+            self._q.put_nowait((to, msg))
+        except queue.Full:
+            pass
 
     def _render_body(self, tid, info, changed) -> str:
         def j(x):
