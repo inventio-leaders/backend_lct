@@ -22,9 +22,26 @@ cd backend_QR
    ниже тупо пример
    
 ```
-DATABASE=postgresql+asyncpg://user:password@localhost/dbname
-ADMIN_PASSWORD=your_admin_password
-SECRET_KEY=your_secret_key
+DATABASE = "postgresql+asyncpg://<username>:<password>@<host>:<port>/<database_name>"
+LOGIN_DB = "<db_login>"
+PASSWORD_DB = "<db_password>"
+
+ADMIN_PASSWORD = "<admin_password>"
+
+PRIVATE_KEY = "<your_private_key>"
+
+SMTP_HOST = "<smtp_host>"
+SMTP_PORT = <smtp_port>
+
+SMTP_USER = "<smtp_user>"
+SMTP_PASS = "<smtp_password>"
+
+SMTP_FROM = "<from_email>"
+SMTP_TO = "<to_email_1>,<to_email_2>"
+
+SMTP_USE_TLS = <true_or_false>
+
+SMTP_SUBJECT_PREFIX = "<subject_prefix>"
 ```
 
 ## Запуск с Docker
